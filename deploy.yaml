@@ -1,0 +1,74 @@
+apiVersion: cert-manager.io/v1alpha2
+kind: Certificate
+metadata:
+  name: aircube-emul
+  namespace: hosting
+spec:
+  commonName: emul.aircube.tech
+  dnsNames:
+    - emul.aircube.tech
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+  secretName: aircube-emul
+---
+kind: Ingress
+apiVersion: extensions/v1beta1
+metadata:
+  name: aircube-emul
+  namespace: hosting
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8g"
+spec:
+  rules:
+    - host: emul.aircube.tech
+      http:
+        paths:
+          - backend:
+              serviceName: aircube-emul
+              servicePort: 80
+            path: /
+  tls:
+    - hosts:
+        - emul.aircube.tech
+      secretName: aircube-emul
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aircube-emul
+  namespace: hosting
+spec:
+  ports:
+    - name: web
+      protocol: TCP
+      port: 80
+      targetPort: 80
+  selector:
+    app: aircube-emul
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: hosting
+  name: aircube-emul
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aircube-emul
+  template:
+    metadata:
+      labels:
+        app: aircube-emul
+    spec:
+      imagePullSecrets:
+        - name: regsecret
+      hostname: aircube-emul
+      containers:
+        - name: aircube-emul
+          image: "IMAGE"
+          imagePullPolicy: IfNotPresent
