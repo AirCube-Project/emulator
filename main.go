@@ -23,18 +23,17 @@ import (
 	"time"
 )
 
-const URLPrefix = "http://localhost:8080/api/v1"
-const WSURL = "ws://localhost:8080/ws"
+//const URLPrefix = "http://localhost:8080/api/v1"
+//const WSURL = "ws://localhost:8080/ws"
 
 const screenWidth = 160
-const screenHeight = 120
+const screenHeight = 128
 
-//const URLPrefix = "https://api.aircube.tech/api/v1"
-//const WSURL = "wss://api.aircube.tech/ws"
+const URLPrefix = "https://api.aircube.tech/api/v1"
+const WSURL = "wss://api.aircube.tech/ws"
 
 type ScreenContent struct {
 	points []byte
-	//todo: text
 }
 
 var screens []ScreenContent
@@ -85,6 +84,14 @@ type FlipButton struct {
 const TYPE_TAP = 0
 const TYPE_FLIP = 1
 const TYPE_CHANGE = 2
+const TYPE_LONGTAP = 3
+const TYPE_MENU = 4
+const TYPE_TELEMETRY = 5 //не используется
+const TYPE_ACCEL = 6     //не используется
+const TYPE_SHAKING = 7
+const TYPE_WIFI_CONNECTED = 8 //не используется
+
+var tapStart time.Time
 
 func (p *FlipButton) Render() vecty.ComponentOrHTML {
 	var ch = "\uF0AA"
@@ -97,14 +104,48 @@ func (p *FlipButton) Render() vecty.ComponentOrHTML {
 		fd = 1
 	}
 
-	return elem.Div(vecty.Markup(vecty.Class("centered")), elem.Div(vecty.Markup(vecty.Class("flip-button"), &vecty.EventListener{Name: "click", Listener: func(event *vecty.Event) {
-		flipped = !flipped
-		data, _ := json.Marshal(CubeInfo{Type: TYPE_FLIP, Cube: 1, State: &fd})
-		SendToServer(string(data))
-		UpdateScreens()
-		vecty.Rerender(emulator)
-	}},
-	), vecty.Text(ch)))
+	return elem.Div(vecty.Markup(vecty.Class("centered")),
+		elem.Div(vecty.Markup(vecty.Class("flip-button"),
+			&vecty.EventListener{Name: "mousedown", Listener: func(event *vecty.Event) {
+				tapStart = time.Now()
+			}},
+			&vecty.EventListener{
+				Name: "mouseup",
+				Listener: func(event *vecty.Event) {
+					var ms = time.Now().Sub(tapStart).Milliseconds()
+					if ms < 500 {
+						flipped = !flipped
+						data, _ := json.Marshal(CubeInfo{Type: TYPE_FLIP, State: &fd})
+						SendToServer(string(data))
+						UpdateScreens()
+						vecty.Rerender(emulator) //short click
+					} else {
+						//эффект "встряхивания"
+						document := js.Global().Get("document")
+						screen0 := document.Call("querySelector", ".screen0")
+						screen0.Get("classList").Call("add", "shaking")
+						screen1 := document.Call("querySelector", ".screen1")
+						screen1.Get("classList").Call("add", "shaking")
+						screen2 := document.Call("querySelector", ".screen2")
+						screen2.Get("classList").Call("add", "shaking")
+						screen3 := document.Call("querySelector", ".screen3")
+						screen3.Get("classList").Call("add", "shaking")
+						go func() {
+							//отправка сообщения на сервер
+							info := CubeInfo{
+								Type: TYPE_SHAKING,
+							}
+							data, _ := json.Marshal(info)
+							SendToServer(string(data))
+							time.Sleep(1500 * time.Millisecond)
+							screen0.Get("classList").Call("remove", "shaking")
+							screen1.Get("classList").Call("remove", "shaking")
+							screen2.Get("classList").Call("remove", "shaking")
+							screen3.Get("classList").Call("remove", "shaking")
+						}()
+					}
+				}},
+		), vecty.Text(ch)))
 }
 
 type LeftButton struct {
@@ -120,7 +161,7 @@ func (p *LeftButton) Render() vecty.ComponentOrHTML {
 				if temp < 0 {
 					temp = 4 - 1
 				}
-				data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Cube: 1, Screen: &temp})
+				data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Screen: &temp})
 				SendToServer(string(data))
 			}
 		}},
@@ -140,7 +181,7 @@ func (p *RightButton) Render() vecty.ComponentOrHTML {
 				temp := active
 				temp++
 				temp = temp % 4
-				data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Cube: 1, Screen: &temp})
+				data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Screen: &temp})
 				SendToServer(string(data))
 			}
 		}}), vecty.Text("\uF054"))
@@ -168,10 +209,13 @@ type PowerOnButton struct {
 	vecty.Core
 }
 
+var socketConnected bool
 var ws js.Value
 
 func SendToServer(s string) {
-	ws.Call("send", s)
+	if socketConnected {
+		ws.Call("send", s)
+	}
 }
 
 func OnMessage(s string) {
@@ -179,24 +223,21 @@ func OnMessage(s string) {
 	var updateInfo UpdateInfo
 	json.Unmarshal([]byte(s), &updateInfo)
 
-	if updateInfo.Select!=nil && *updateInfo.Select {
+	if updateInfo.Select != nil && *updateInfo.Select {
 		//change selection
 		active = *updateInfo.Screen
-		if updateInfo.Position!=nil {
+		if updateInfo.Position != nil {
 			//change screen and position
 			descriptors[active].selected = *updateInfo.Position
+			println("Change position on ", active)
 			RenderList(active)
-		} else {
-			if descriptors[active].navigable {
-				descriptors[active].selected = 0
-				//send to server change to zero
-				zero := 0
-				data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Cube: 1, Screen: &active, State: &zero})
-				SendToServer(string(data))
-			}
 		}
 		vecty.Rerender(emulator)
 	} else {
+		println("Token")
+		if token != nil {
+			println(*token)
+		}
 		if updateInfo.Screen != nil {
 			if updateInfo.IsText {
 				GetListFromNetwork(*updateInfo.Screen)
@@ -225,23 +266,31 @@ type HelloMessage struct {
 
 var sn *uint32
 
-func LoggedIn() {
+func LoggedIn(relogin bool) {
+	println("Logged in")
 	hello := HelloMessage{
 		Token: token,
 		SN:    sn,
 		Pin:   nil,
 	}
 	hello_json, _ := json.Marshal(hello)
+	if relogin {
+		println("Relogin")
+		SendToServer(string(hello_json))
+	}
+	println("Send hello message ", hello_json)
 	ws.Call("addEventListener", "open", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		SendToServer(string(hello_json))
 		return nil
 	}))
 	ws.Call("addEventListener", "close", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		ws = js.Global().Get("WebSocket").New(WSURL)
+		socketConnected = true
 		return nil
 	}))
 	ws.Call("addEventListener", "message", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		arg0 := args[0].Get("data").String()
+		println("Message accepted ", arg0)
 		OnMessage(arg0)
 		return nil
 	}))
@@ -251,9 +300,10 @@ func PoweringOn() {
 	lightColor, _ = colors.RGBA(31, 191, 191, 1)
 	//check init mode
 	ws = js.Global().Get("WebSocket").New(WSURL)
+	socketConnected = true
 	if !registration_mode {
 		//register js function
-		LoggedIn()
+		LoggedIn(false)
 	} else {
 		Register()
 	}
@@ -274,7 +324,7 @@ func Register() {
 	brightnessShift = 2
 	blink = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		brightness = uint8(int(brightness) + brightnessShift)
-		if brightness > 192 || brightness < 16 {
+		if brightness > 192 || brightness < 64 {
 			brightnessShift = -brightnessShift
 		}
 		lightColor, _ = colors.RGB(brightness, brightness, brightness)
@@ -294,24 +344,46 @@ func Register() {
 		return nil
 	}))
 	ws.Call("addEventListener", "message", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		arg0 := args[0].Get("data").String()
-		var db DeviceBound
-		err := json.Unmarshal([]byte(arg0), &db)
-		if err == nil {
-			token = &db.Token
-			sn = &db.SN
-			registration_mode = false
+		if registration_mode {
+			arg0 := args[0].Get("data").String()
+			var db DeviceBound
+			err := json.Unmarshal([]byte(arg0), &db)
+			if err == nil {
+				token = &db.Token
+				sn = &db.SN
+				registration_mode = false
+				var poweredOn = true
+				println("Token is ", *token)
 
-			config := Configuration{
-				Token: db.Token,
-				SN:    db.SN,
+				config := Configuration{
+					Token:     *token,
+					SN:        *sn,
+					PoweredOn: &poweredOn,
+				}
+				configdata, _ := json.Marshal(config)
+				println("Config is ", configdata)
+				StoreToLocalStorage("config", &configdata)
+				LoggedIn(true)
 			}
-			configdata, _ := json.Marshal(config)
-			StoreToLocalStorage("config", &configdata)
-			LoggedIn()
 		}
 		return nil
 	}))
+}
+
+func UpdatePowerState() {
+	if powerOn {
+		PoweringOn()
+	} else {
+		if socketConnected {
+			ws.Call("close")
+			socketConnected = false
+		}
+		lightColor = colors.FromStdColor(color.Black)
+		ClearScreens()
+	}
+	print("Rerender")
+	print(emulator)
+	vecty.Rerender(emulator)
 }
 
 func (p *PowerOnButton) Render() vecty.ComponentOrHTML {
@@ -322,14 +394,14 @@ func (p *PowerOnButton) Render() vecty.ComponentOrHTML {
 				Name: "click",
 				Listener: func(event *vecty.Event) {
 					powerOn = !powerOn
-					if powerOn {
-						PoweringOn()
-					} else {
-						ws.Call("close")
-						lightColor = colors.FromStdColor(color.Black)
-						ClearScreens()
-					}
-					vecty.Rerender(emulator)
+					var state = GetFromLocalStorage("config")
+					var config Configuration
+					print("Current config is ", state)
+					json.Unmarshal([]byte(*state), &config)
+					config.PoweredOn = &powerOn
+					configdata, _ := json.Marshal(config)
+					StoreToLocalStorage("config", &configdata)
+					UpdatePowerState()
 				},
 			},
 			vecty.MarkupIf(powerOn, vecty.Class("on"))),
@@ -353,52 +425,100 @@ func (p *ButtonPanel) Render() vecty.ComponentOrHTML {
 		vecty.Markup(
 			vecty.Class("centered")),
 		elem.Anchor(vecty.Markup(vecty.Class("touch-button"),
-			&vecty.EventListener{Name: "click", Listener: func(event *vecty.Event) {
-				if descriptors[active].navigable {
-					pos := descriptors[active].selected
-					pos--
-					if pos < 0 {
-						pos = descriptors[active].count - 1
-					}
-					data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Cube: 1, Screen: &active, State: &pos})
-					SendToServer(string(data))
-				}
+			&vecty.EventListener{Name: "mousedown", Listener: func(event *vecty.Event) {
+				tapStart = time.Now()
 			}},
+			&vecty.EventListener{
+				Name: "mouseup",
+				Listener: func(event *vecty.Event) {
+					var ms = time.Now().Sub(tapStart).Milliseconds()
+					if descriptors[active].navigable {
+						if ms < 1000 {
+							pos := descriptors[active].selected
+							pos--
+							if pos < 0 {
+								pos = descriptors[active].count - 1
+							}
+							data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Screen: &active, State: &pos})
+							SendToServer(string(data))
+						} else {
+							pos := 0
+							data, _ := json.Marshal(CubeInfo{
+								Type:   TYPE_CHANGE,
+								Screen: &active,
+								State:  &pos,
+							})
+							SendToServer(string(data))
+						}
+					}
+				}},
 		), vecty.Text("\uF077")),
 		elem.Anchor(vecty.Markup(vecty.Class("touch-button"),
-			&vecty.EventListener{Name: "click", Listener: func(event *vecty.Event) {
-				var tap CubeInfo
-				if descriptors[active].navigable {
-					tap = CubeInfo{
-						Type:   TYPE_TAP,
-						Cube:   1,
-						Screen: &active,
-						State:  &screenLists[active][descriptors[active].selected].Number,
+			&vecty.EventListener{Name: "mousedown", Listener: func(event *vecty.Event) {
+				tapStart = time.Now()
+			}},
+			&vecty.EventListener{
+				Name: "mouseup",
+				Listener: func(event *vecty.Event) {
+					var ms = time.Now().Sub(tapStart).Milliseconds()
+					var tap CubeInfo
+					var tapType int
+					if ms < 2000 {
+						tapType = TYPE_TAP
+						if ms >= 1000 {
+							tapType = TYPE_LONGTAP
+						}
+						if descriptors[active].navigable {
+							tap = CubeInfo{
+								Type:   tapType,
+								Screen: &active,
+								State:  &screenLists[active][descriptors[active].selected].Number,
+							}
+						} else {
+							tap = CubeInfo{
+								Type:   tapType,
+								Screen: &active,
+								State:  nil,
+							}
+						}
+					} else {
+						tap = CubeInfo{
+							Type: TYPE_MENU,
+						}
 					}
-				} else {
-					tap = CubeInfo{
-						Type:   TYPE_TAP,
-						Cube:   0,
-						Screen: &active,
-						State:  nil,
-					}
-				}
-				data, _ := json.Marshal(tap)
-				SendToServer(string(data))
-			},
+					data, _ := json.Marshal(tap)
+					SendToServer(string(data))
+				},
 			}), vecty.Text("\uF058")),
 		elem.Anchor(vecty.Markup(vecty.Class("touch-button"),
-			&vecty.EventListener{Name: "click", Listener: func(event *vecty.Event) {
-				if descriptors[active].navigable {
-					pos := descriptors[active].selected
-					pos++
-					if pos >= descriptors[active].count {
-						pos = 0
-					}
-					data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Cube: 1, Screen: &active, State: &pos})
-					SendToServer(string(data))
-				}
+			&vecty.EventListener{Name: "mousedown", Listener: func(event *vecty.Event) {
+				tapStart = time.Now()
 			}},
+			&vecty.EventListener{
+				Name: "mouseup",
+				Listener: func(event *vecty.Event) {
+					var ms = time.Now().Sub(tapStart).Milliseconds()
+
+					if descriptors[active].navigable {
+						if ms < 1000 {
+							pos := descriptors[active].selected
+							pos++
+							if pos >= descriptors[active].count {
+								pos = 0
+							}
+							data, _ := json.Marshal(CubeInfo{Type: TYPE_CHANGE, Screen: &active, State: &pos})
+							SendToServer(string(data))
+						} else {
+							pos := descriptors[active].count - 1
+							data, _ := json.Marshal(CubeInfo{
+								Type:   TYPE_CHANGE,
+								Screen: &active,
+								State:  &pos,
+							})
+							SendToServer(string(data))
+						}
+					}
+				}},
 		), vecty.Text("\uF078")),
 	)
 }
@@ -470,14 +590,17 @@ func StoreToLocalStorage(key string, data *[]byte) {
 }
 
 type Configuration struct {
-	Token string `json:"token"`
-	SN    uint32 `json:"sn"`
+	Token     string `json:"token"`
+	SN        uint32 `json:"sn"`
+	PoweredOn *bool  `json:"powered_on"`
 }
 
 var token *string
 var registration_mode bool
 
 func main() {
+	socketConnected = false
+
 	c := GetFromLocalStorage("config")
 	token = nil
 	if c == nil {
@@ -486,13 +609,16 @@ func main() {
 	} else {
 		var conf Configuration
 		err := json.Unmarshal([]byte(*c), &conf)
-		if err != nil {
+		if err != nil || conf.Token == "" {
 			registration_mode = true
 			//goto registration mode
 		} else {
 			token = &conf.Token
 			sn = &conf.SN
 			registration_mode = false
+			if conf.PoweredOn != nil {
+				powerOn = *conf.PoweredOn
+			}
 		}
 	}
 	//init screens
@@ -504,17 +630,16 @@ func main() {
 		descriptors = append(descriptors, descriptor)
 		items := make([]ListItem, 0, 0)
 		screenLists = append(screenLists, items)
-		ClearScreen(i)
 	}
 
 	vecty.SetTitle("AirCube Emulator")
 	vecty.AddStylesheet("main.css")
 
-	powerOn = false
 	lightColor = colors.FromStdColor(color.Black)
 
 	emulator = &Emulator{}
 	vecty.RenderInto("body", emulator)
+	UpdatePowerState()
 
 	for i := 0; i < 4; i++ {
 		d := js.Global().Get("document").Call("querySelector", "#canvas"+strconv.Itoa(i))
@@ -555,6 +680,7 @@ type ListItem struct {
 	IconHeight *int    `json:"icon_height" example:"8"`
 	Icon       *string `json:"icon" example:""`
 	Color      *string `json:"color" example:"#FFFFFF"`
+	Size       *int    `json:"size" example:"1"`
 }
 
 func EncodeWindows1251(ba []uint8) []uint8 {
@@ -563,32 +689,43 @@ func EncodeWindows1251(ba []uint8) []uint8 {
 	return []uint8(out)
 }
 
-func PrintTextLine(win1251 []byte, base_shift int, screen int, x int, y int, r byte, g byte, b byte) {
+func PrintTextLine(win1251 []byte, base_shift int, screen int, x int, y int, r byte, g byte, b byte, size *int) {
 
+	sz := 1
+	if size != nil {
+		sz = *size
+	}
+	log.Println("Size is ", sz)
 	for c := 0; c < len(win1251); c++ {
 		var ch = win1251[c]
 		pos := int(ch) * 8
+
 		for cy := 0; cy < 8; cy++ {
-			if y+cy >= screenHeight || y+cy < base_shift {
-				continue
-			}
 			row := font[pos+cy]
 			for cx := 7; cx >= 0; cx-- {
 				if row%2 != 0 {
-					SetPixel(screen, x+cx, y+cy, r, g, b)
+					for dy := 0; dy < sz; dy++ {
+						for dx := 0; dx < sz; dx++ {
+							if y+cy*sz+dy >= screenHeight || y+cy*sz+dy < base_shift {
+								continue
+							}
+							SetPixel(screen, x+cx*sz+dx, y+cy*sz+dy, r, g, b)
+						}
+					}
 				}
 				row = row >> 1
 			}
 		}
-		x += 8
+		x += 8 * sz
 		if x >= screenWidth {
 			x = 0
-			y += 8
+			y += 8 * sz
 		}
 	}
 }
 
 func RenderList(screen int) {
+	log.Println("Render list for ", screen)
 	ClearScreen(screen)
 	list := screenLists[screen]
 	descriptors[screen].count = len(list)
@@ -597,68 +734,77 @@ func RenderList(screen int) {
 	top_line := descriptors[screen].topLine
 	selt := descriptors[screen].selected
 
-	if selt>=len(list) {
-		return
-	}
+	println(selt)
+	println(len(list))
+	println(descriptors[screen].navigable)
 
-	sely := list[selt].Y - top_shift
 	baseShift := 0
 	if descriptors[screen].title != nil {
 		baseShift = 24
 		win1251 := EncodeWindows1251([]uint8(*descriptors[screen].title))
-		PrintTextLine(win1251, 0, screen, 8, 8, 255, 255, 255)
+		size := 1
+		PrintTextLine(win1251, 0, screen, 8, 8, 255, 255, 255, &size)
 		for x := 0; x <= screenWidth; x++ {
 			SetPixel(screen, x, 20, 255, 255, 255)
 		}
 	}
-	//scroll up
-	if sely+8 >= screenHeight-baseShift {
-		shift := 1
-		delta := 0
-		for {
-			//todo: problem!!!
-			delta = list[top_line+shift].Y - list[top_line].Y
-			if sely+8-delta < screenHeight-baseShift {
-				break
-			}
-			shift++
-		}
-		descriptors[screen].topLine += shift
-		descriptors[screen].topY += delta
-		top_shift = descriptors[screen].topY
-	}
-	if sely < 0 {
-		shift := 1
-		delta := 0
-		//detect bottom line
-		line := top_line
-		for {
-			if list[line].Y+8 >= screenHeight-baseShift {
-				break
-			}
-			line++
-			if line >= len(list) {
-				line--
-				break
-			}
-		}
-		//line - id последней видимой целиком строки
-		for {
-			delta = list[line].Y - list[line-shift].Y
-
-			if sely+delta >= 0 {
-				break
-			}
-			shift++
-		}
-		descriptors[screen].topLine -= shift
-		if descriptors[screen].topLine < 0 {
-			descriptors[screen].topLine = 0
-		}
-		descriptors[screen].topY -= delta
-		top_shift = descriptors[screen].topY
+	if selt >= len(list) && descriptors[screen].navigable {
+		return
 	}
 
+	if descriptors[screen].navigable {
+		sely := list[selt].Y - top_shift
+		//scroll up
+		if sely+8 >= screenHeight-baseShift {
+			shift := 1
+			delta := 0
+			for {
+				//todo: problem!!!
+				delta = list[top_line+shift].Y - list[top_line].Y
+				if sely+8-delta < screenHeight-baseShift {
+					break
+				}
+				shift++
+			}
+			descriptors[screen].topLine += shift
+			descriptors[screen].topY += delta
+			top_shift = descriptors[screen].topY
+		}
+		println("TopShift is ", top_shift)
+		if sely < 0 {
+			shift := 1
+			delta := 0
+			//detect bottom line
+			line := top_line
+			for {
+				if list[line].Y+8 >= screenHeight-baseShift {
+					break
+				}
+				line++
+				if line >= len(list) {
+					line--
+					break
+				}
+			}
+			//line - id последней видимой целиком строки
+			for {
+				delta = list[line].Y - list[line-shift].Y
+
+				if sely+delta >= 0 {
+					break
+				}
+				shift++
+			}
+			descriptors[screen].topLine -= shift
+			if descriptors[screen].topLine < 0 {
+				descriptors[screen].topLine = 0
+			}
+			descriptors[screen].topY -= delta
+			top_shift = descriptors[screen].topY
+		}
+	}
+
+	line_width := screenWidth / 8
 	for i := 0; i < len(list); i++ {
 		x := list[i].X
 		y := list[i].Y
@@ -705,13 +851,24 @@ func RenderList(screen int) {
 				yshift = (line_height - 8) / 2
 			}
 		}
-		PrintTextLine(win1251, baseShift, screen, x, y+yshift, r, g, b)
+		size := list[i].Size
+		log.Println("Printing text line at ", x, y+screenHeight, text)
+		PrintTextLine(win1251, baseShift, screen, x, y+yshift, r, g, b, size)
 
 		if active == screen && descriptors[screen].selected == i && descriptors[screen].navigable {
-			left := list[i].X - 2
-			right := list[i].X + len(win1251)*8 + xdelta + 4
-			top := list[i].Y - top_shift - 4 + baseShift
-			bottom := list[i].Y - top_shift + line_height + 2 + baseShift
+			lines := (len(win1251) + line_width) / line_width
+			var left, right, top, bottom int
+			if lines <= 1 {
+				left = list[i].X - 2
+				right = list[i].X + len(win1251)*8 + xdelta + 4
+				top = list[i].Y - top_shift - 4 + baseShift
+				bottom = list[i].Y - top_shift + line_height + 2 + baseShift
+			} else {
+				left = 1
+				right = screenWidth - 2
+				top = list[i].Y - top_shift - 4 + baseShift
+				bottom = top + lines*8 + 6
+			}
 			if top < screenHeight && top >= baseShift {
 				for x := left; x <= right; x++ {
 					SetPixel(screen, x, top, 255, 255, 255)
@@ -738,19 +895,21 @@ func RenderList(screen int) {
 
 func SetPoint(screen int, img []byte, i int, pos int) {
 	var point uint16
-	point = uint16(img[i*2+1])
-	point = point << 8
-	point = point + uint16(img[i*2])
-	b := point % 32
-	g := (point >> 5) % 64
-	r := (point >> 11) % 32
-	if flipped {
-		pos = screenHeight*screenWidth - 1 - pos
+	if i*2+1 < len(img) {
+		point = uint16(img[i*2+1])
+		point = point << 8
+		point = point + uint16(img[i*2])
+		b := point % 32
+		g := (point >> 5) % 64
+		r := (point >> 11) % 32
+		if !flipped {
+			pos = screenHeight*screenWidth - 1 - pos
+		}
+		screens[screen].points[pos*4] = byte(r << 3)
+		screens[screen].points[pos*4+1] = byte(g << 2)
+		screens[screen].points[pos*4+2] = byte(b << 3)
+		screens[screen].points[pos*4+3] = 255
 	}
-	screens[screen].points[pos*4] = byte(r << 3)
-	screens[screen].points[pos*4+1] = byte(g << 2)
-	screens[screen].points[pos*4+2] = byte(b << 3)
-	screens[screen].points[pos*4+3] = 255
 }
 
 func SetScreen(screen int, img []byte) {
@@ -786,6 +945,8 @@ func GetImageFromNetwork(screen int) {
 func GetListFromNetwork(screen int) {
 	go func() {
 		client := &http.Client{}
+		print("Token is ")
+		println(token)
 		req2, err2 := http.NewRequest("GET", URLPrefix+"/list/"+strconv.Itoa(screen), nil)
 		req2.Header.Set("Authorization", "bearer "+*token)
 		resp2, _ := client.Do(req2)
@@ -821,6 +982,7 @@ func UpdateScreens() {
 
 func UpdateScreen(screen int) {
 	if descriptors[screen].list {
+		println("Update screen ", screen)
 		RenderList(screen)
 	} else {
 		GetImageFromNetwork(screen)
@@ -989,12 +1151,12 @@ func DrawDigit(screen int, digit int) {
 
 	ClearScreen(screen)
 	digitSize := 4
-	pos := digit * 32 * 4
+	pos := digit * 8 * digitSize * digitSize
 	y := 0
 	x := 16
-	for cy := 0; cy < 32; cy++ {
-		for shift := 3; shift >= 0; shift-- {
-			row := int(digits[pos+cy*4+shift])
+	for cy := 0; cy < 8*digitSize; cy++ {
+		for shift := digitSize - 1; shift >= 0; shift-- {
+			row := int(digits[pos+cy*digitSize+shift])
 			for cx := 7; cx >= 0; cx-- {
 				if row%2 != 0 {
 					for dy := 0; dy < digitSize; dy++ {
@@ -1036,7 +1198,6 @@ type UpdateInfo struct {
 
 type CubeInfo struct {
 	Type   int  `json:"type"`
-	Cube   int  `json:"cube"`
-	Screen *int `json:"screen"`
-	State  *int `json:"state"`
+	Screen *int `json:"screen,omitempty"`
+	State  *int `json:"state,omitempty"`
 }
